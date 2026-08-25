@@ -1,47 +1,3 @@
-"""
-Vahliy uyg'otish xizmati - Telegram bot (bitta fayl - bot.py)
-
-Oqim:
-1. /start -> foydalanuvchi "qiziqqanlar" ro'yxatiga yoziladi (ism/username bilan)
-   -> "Vahliy uyg'otish xizmatidan foydalanmoqchiman" tugmasi
-2. Tugma bosilsa -> foydalanuvchi "foydalanuvchilar" ro'yxatiga o'tadi
-3. Telefon raqam (yuborish tugmasi orqali YOKI qo'lda yozib)
-4. Ism
-5. Nima uchun kerakligi (sabab)
-6. Vaqti (soat:daqiqa)
-7. Kun tanlanadi -> faqat JORIY OYNING kunlari ko'rsatiladi (o'tib ketgan kunlarsiz)
-8. To'lov: Payme / Click (bulargina inline/callback tugma)
-9. Karta raqami ko'rsatiladi -> "To'lov qildim" tugmasi
-10. Chek skrinshoti so'raladi -> adminga yuboriladi
-11. Admin qabul qiladi / qilmaydi (sababli yoki sababsiz)
-12. Admin panel: karta raqamini o'rnatish, buyurtmalar ro'yxati, foydalanuvchilar ro'yxati
-13. Belgilangan vaqtda adminga avtomatik eslatma yuboriladi, eslatmada
-    "✅ Ha, gaplashdim" tugmasi bo'ladi - bosilsa, eslatmaga javob (reply)
-    tarzida "Bu odam bilan gaplashildi" deb yoziladi
-
-========================== SOZLASH ==========================
-BOT_TOKEN va ADMIN_IDS ni .env faylida ko'rsating (bot.py bilan bir
-papkada). Masalan .env fayli ichida:
-
-    BOT_TOKEN=123456:ABC-DEF_your_bot_token_here
-    ADMIN_IDS=1671888527,987654321
-
-Agar .env da ADMIN_IDS ko'rsatilmasa, pastdagi ADMIN_ID qiymati admin
-sifatida ishlatiladi. BOT_TOKEN esa har doim .env dan o'qiladi va
-kodda hech qachon ochiq yozilmaydi.
-
-O'rnatish:
-    pip install aiogram==3.13.1 APScheduler==3.10.4 python-dotenv
-
-Ishga tushirish:
-    python3 bot.py
-
-Admin panelga kirish: botga /admin deb yozing. Agar sizning Telegram ID
-raqamingiz .env dagi ADMIN_IDS ro'yxatida bo'lsa, avtomatik ravishda
-admin panelga kirasiz (ID so'ralmaydi). @userinfobot orqali o'z ID
-raqamingizni bilib olishingiz mumkin.
-================================================================
-"""
 import asyncio
 import calendar
 import logging
@@ -49,6 +5,7 @@ import os
 import re
 import sqlite3
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
@@ -81,8 +38,9 @@ if not BOT_TOKEN:
     raise RuntimeError(
         "BOT_TOKEN topilmadi. Iltimos, .env fayliga BOT_TOKEN=... qatorini qo'shing."
     )
-DB_PATH = "vahliy_bot.db"                     # Ma'lumotlar bazasi fayli
-REMINDER_BEFORE_MINUTES = 5                   # Eslatma necha daqiqa oldin yuborilsin
+DB_PATH = os.getenv("DB_PATH", "vahliy_bot.db")
+REMINDER_BEFORE_MINUTES = 5
+UZ_TZ = ZoneInfo("Asia/Tashkent")
 
 # .env faylidagi ADMIN_IDS ro'yxati (masalan: ADMIN_IDS=111,222,333)
 # Agar .env da ko'rsatilmagan bo'lsa, faqat yuqoridagi ADMIN_ID admin bo'ladi.
@@ -92,12 +50,14 @@ ADMIN_IDS = {
 }
 if not ADMIN_IDS:
     ADMIN_IDS = {ADMIN_ID}
+else:
+    ADMIN_ID = next(iter(ADMIN_IDS))
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(timezone=UZ_TZ)
 
 TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 # Qo'lda kiritilgan telefon raqamlarini tekshirish uchun (masalan: +998901234567,
@@ -329,7 +289,7 @@ def day_only_kb(month_num: int, year: int) -> ReplyKeyboardMarkup:
     Faqat berilgan (joriy) oy va yilga tegishli kunlar tugmalarini quradi
     (bugungi kundan oldingi kunlarsiz). Boshqa oylar hech qachon ko'rsatilmaydi.
     """
-    today = date.today()
+    today = datetime.now(UZ_TZ).date()
     days_in_month = calendar.monthrange(year, month_num)[1]
     start_day = today.day if (year == today.year and month_num == today.month) else 1
     day_buttons = [KeyboardButton(text=str(d)) for d in range(start_day, days_in_month + 1)]
@@ -422,6 +382,9 @@ async def start_order(message: Message, state: FSMContext):
 
 @dp.message(OrderStates.waiting_phone, F.contact)
 async def get_phone_contact(message: Message, state: FSMContext):
+    if message.contact.user_id and message.contact.user_id != message.from_user.id:
+        await message.answer("Iltimos, o'zingizning telefon raqamingizni yuboring.", reply_markup=phone_kb())
+        return
     phone = message.contact.phone_number
     data = await state.get_data()
     update_order(data["order_id"], phone=phone)
@@ -464,7 +427,10 @@ async def get_phone_wrong(message: Message):
 
 @dp.message(OrderStates.waiting_name)
 async def get_name(message: Message, state: FSMContext):
-    name = message.text.strip()
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Iltimos, ismingizni kiriting:")
+        return
     data = await state.get_data()
     update_order(data["order_id"], full_name=name)
     await state.update_data(full_name=name)
@@ -478,7 +444,10 @@ async def get_name(message: Message, state: FSMContext):
 
 @dp.message(OrderStates.waiting_reason)
 async def get_reason(message: Message, state: FSMContext):
-    reason = message.text.strip()
+    reason = (message.text or "").strip()
+    if not reason:
+        await message.answer("Iltimos, sababni yozing:")
+        return
     data = await state.get_data()
     update_order(data["order_id"], reason=reason)
     await state.set_state(OrderStates.waiting_time)
@@ -503,7 +472,7 @@ async def get_time(message: Message, state: FSMContext):
 
     # Faqat joriy oyning kunlari ko'rsatiladi (masalan hozir avgust bo'lsa,
     # faqat avgust kunlari chiqadi; sentyabr bo'lsa, faqat sentyabr kunlari).
-    today = date.today()
+    today = datetime.now(UZ_TZ).date()
     await state.update_data(selected_month=today.month, selected_year=today.year)
     await state.set_state(OrderStates.waiting_day)
     await message.answer(
@@ -515,7 +484,7 @@ async def get_time(message: Message, state: FSMContext):
 @dp.message(OrderStates.waiting_day)
 async def get_day(message: Message, state: FSMContext):
     data = await state.get_data()
-    today = date.today()
+    today = datetime.now(UZ_TZ).date()
     month_num = data.get("selected_month") or today.month
     year = data.get("selected_year") or today.year
 
@@ -543,6 +512,17 @@ async def get_day(message: Message, state: FSMContext):
             reply_markup=day_only_kb(month_num, year),
         )
         return
+
+    # Bugungi kun tanlansa, tanlangan vaqt allaqachon o'tib ketgan bo'lmasin.
+    if selected == today:
+        time_text = get_order(data["order_id"])["time_str"]
+        target = datetime.fromisoformat(f"{selected.isoformat()} {time_text}").replace(tzinfo=UZ_TZ)
+        if target <= datetime.now(UZ_TZ):
+            await message.answer(
+                "Bu vaqt allaqachon o'tib ketgan. Iltimos, kelajakdagi vaqtni kiriting.",
+                reply_markup=day_only_kb(month_num, year),
+            )
+            return
 
     update_order(data["order_id"], date_str=selected.isoformat())
     await state.set_state(OrderStates.waiting_payment_method)
@@ -599,12 +579,16 @@ async def get_screenshot(message: Message, state: FSMContext):
         f"💳 To'lov usuli: {order['payment_method']}\n"
         f"🆔 Buyurtma raqami: {order_id}"
     )
-    await bot.send_photo(
-        chat_id=ADMIN_ID,
-        photo=message.photo[-1].file_id,
-        caption=caption,
-        reply_markup=admin_decision_kb(order_id),
-    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_photo(
+                chat_id=admin_id,
+                photo=message.photo[-1].file_id,
+                caption=caption,
+                reply_markup=admin_decision_kb(order_id),
+            )
+        except Exception:
+            logging.exception("Order #%s chekini admin %s ga yuborishda xato.", order_id, admin_id)
     await message.answer(
         "Chekingiz adminga yuborildi. Tez orada tasdiqlanadi, iltimos kuting ⏳",
         reply_markup=main_menu_kb(),
@@ -623,6 +607,10 @@ async def get_screenshot_wrong(message: Message):
 
 @dp.callback_query(F.data.startswith("accept_"))
 async def admin_accept(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Sizda bu amal uchun ruxsat yo'q.", show_alert=True)
+        return
+
     order_id = int(callback.data.split("_")[1])
     order = get_order(order_id)
     if order is None:
@@ -649,6 +637,10 @@ async def admin_accept(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def admin_reject_ask_reason(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Sizda bu amal uchun ruxsat yo'q.", show_alert=True)
+        return
+
     order_id = int(callback.data.split("_")[1])
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(
@@ -660,6 +652,10 @@ async def admin_reject_ask_reason(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("rejreason_no_"))
 async def admin_reject_no_reason(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Sizda bu amal uchun ruxsat yo'q.", show_alert=True)
+        return
+
     order_id = int(callback.data.split("_")[2])
     order = get_order(order_id)
     update_order(order_id, status="rejected")
@@ -675,6 +671,10 @@ async def admin_reject_no_reason(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("rejreason_yes_"))
 async def admin_reject_yes_reason(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Sizda bu amal uchun ruxsat yo'q.", show_alert=True)
+        return
+
     order_id = int(callback.data.split("_")[2])
     await state.update_data(reject_order_id=order_id)
     await state.set_state(AdminStates.waiting_reject_reason)
@@ -685,6 +685,10 @@ async def admin_reject_yes_reason(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AdminStates.waiting_reject_reason)
 async def admin_reject_reason_text(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        await state.clear()
+        return
+
     data = await state.get_data()
     order_id = data["reject_order_id"]
     order = get_order(order_id)
@@ -706,6 +710,10 @@ async def admin_reject_reason_text(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("talked_"))
 async def admin_talked(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Sizda bu amal uchun ruxsat yo'q.", show_alert=True)
+        return
+
     order_id = int(callback.data.split("_")[1])
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.reply("✅ Bu odam bilan gaplashildi.")
@@ -749,6 +757,10 @@ async def admin_set_card_start(message: Message, state: FSMContext):
 
 @dp.message(AdminStates.waiting_card_number)
 async def admin_set_card_save(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        await state.clear()
+        return
+
     card_number = message.text.strip()
     set_setting("card_number", card_number)
     await state.clear()
@@ -825,45 +837,89 @@ async def admin_users_list(message: Message):
 # ESLATMA (SCHEDULER)
 # ============================================================
 
+def _order_datetime(order):
+    """Buyurtma sanasi va vaqtini O‘zbekiston vaqti bilan qaytaradi."""
+    return datetime.fromisoformat(
+        f"{order['date_str']} {order['time_str']}"
+    ).replace(tzinfo=UZ_TZ)
+
+
 def schedule_reminder(order_id: int):
+    """Buyurtma uchun 5 daqiqalik reminder yaratadi."""
     order = get_order(order_id)
-    if not order or not order["date_str"] or not order["time_str"]:
+    if not order or order["status"] != "accepted":
+        return
+    if not order["date_str"] or not order["time_str"]:
+        logging.warning("Order #%s sana yoki vaqtsiz.", order_id)
         return
 
-    dt = datetime.fromisoformat(f"{order['date_str']} {order['time_str']}")
-    run_at = dt - timedelta(minutes=REMINDER_BEFORE_MINUTES)
+    try:
+        target = _order_datetime(order)
+        now = datetime.now(UZ_TZ)
+        run_at = target - timedelta(minutes=REMINDER_BEFORE_MINUTES)
 
-    if run_at < datetime.now():
-        run_at = datetime.now() + timedelta(seconds=5)
+        # Reminder vaqti o'tgan, lekin uyg'otish vaqti hali kelmagan bo'lsa,
+        # bot ishga kech tushgan holat uchun qisqa kechikish bilan yuboramiz.
+        if run_at <= now < target:
+            run_at = now + timedelta(seconds=3)
 
-    scheduler.add_job(
-        send_admin_reminder,
-        "date",
-        run_date=run_at,
-        args=[order_id],
-        id=f"reminder_{order_id}",
-        replace_existing=True,
-        misfire_grace_time=3600,
-    )
+        # Uyg'otish vaqti ham o'tgan bo'lsa, eski reminder yuborilmaydi.
+        if target <= now:
+            logging.info("Order #%s uchun vaqt o'tgan, reminder o'tkazib yuborildi.", order_id)
+            return
+
+        scheduler.add_job(
+            send_admin_reminder,
+            trigger="date",
+            run_date=run_at,
+            args=[order_id],
+            id=f"reminder_{order_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        logging.info("Reminder #%s scheduled: %s", order_id, run_at.isoformat())
+    except (ValueError, TypeError):
+        logging.exception("Order #%s reminder vaqtida xato.", order_id)
+
+
+def restore_reminders():
+    """Restart/redeploydan keyin DB'dagi accepted buyurtmalarni tiklaydi."""
+    restored = 0
+    for order in get_orders_by_status(["accepted"]):
+        try:
+            if _order_datetime(order) > datetime.now(UZ_TZ):
+                schedule_reminder(order["id"])
+                restored += 1
+        except Exception:
+            logging.exception("Order #%s reminderini tiklashda xato.", order["id"])
+    logging.info("%s ta reminder qayta tiklandi.", restored)
 
 
 async def send_admin_reminder(order_id: int):
     order = get_order(order_id)
     if not order or order["status"] != "accepted":
         return
-    await bot.send_message(
-        chat_id=ADMIN_ID,
-        text=(
-            "⏰ Eslatma!\n\n"
-            f"👤 {order['full_name']}\n"
-            f"📞 {order['phone']}\n"
-            f"🕐 Belgilangan vaqt: {order['time_str']} ({order['date_str']})\n\n"
-            f"Hozir shu raqamga qo'ng'iroq qilib, quyidagini ayting:\n"
-            f"\"{order['reason']}\"\n\n"
-            "Bu odam bilan gaplashdingizmi?"
-        ),
-        reply_markup=admin_reminder_kb(order_id),
+
+    text = (
+        "⏰ <b>5 daqiqalik eslatma</b>\n\n"
+        f"👤 <b>Ism:</b> {order['full_name'] or '-'}\n"
+        f"📞 <b>Telefon:</b> {order['phone'] or '-'}\n"
+        f"📅 <b>Sana:</b> {order['date_str'] or '-'}\n"
+        f"🕐 <b>Vaqt:</b> {order['time_str'] or '-'}\n"
+        f"🎯 <b>Sabab:</b> {order['reason'] or '-'}\n\n"
+        "Iltimos, hozir shu raqamga qo'ng'iroq qiling."
     )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=admin_reminder_kb(order_id),
+            )
+        except Exception:
+            logging.exception("Reminder #%s admin %s ga yuborilmadi.", order_id, admin_id)
 
 
 # ============================================================
@@ -872,8 +928,19 @@ async def send_admin_reminder(order_id: int):
 
 async def main():
     init_db()
+    logging.info("Bot ishga tushmoqda...")
+    logging.info("Adminlar: %s", sorted(ADMIN_IDS))
+    logging.info("Reminder: %s daqiqa oldin", REMINDER_BEFORE_MINUTES)
+
     scheduler.start()
-    await dp.start_polling(bot)
+    restore_reminders()
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+        await bot.session.close()
 
 
 if __name__ == "__main__":
